@@ -7,6 +7,7 @@ FAIL_FILE="/tmp/autorip.fail"
 LOG_DIR="$HOME/.mediahub/logs"
 LOG_FILE="$LOG_DIR/discwatcher.log"
 RIP="$HOME/bin/rip"
+MEDIA_ROOT="${MEDIA_ROOT:-/Volumes/M4Drive/media}"
 
 log() {
     mkdir -p "$LOG_DIR" 2>/dev/null
@@ -31,8 +32,8 @@ log "Disc watcher started (PID $$)"
 osascript -e 'display notification "Disc watcher is running" with title "Media Hub"' 2>/dev/null || true
 
 while true; do
-    # Wait for M4Drive to be mounted
-    if [[ ! -d "/Volumes/M4Drive/media" ]]; then
+    # Wait for the destination dir to exist
+    if [[ ! -d "$MEDIA_ROOT" ]]; then
         sleep 30
         continue
     fi
