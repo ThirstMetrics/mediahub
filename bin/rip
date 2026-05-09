@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-MEDIA_ROOT="/Volumes/M4Drive/media"
+MEDIA_ROOT="${MEDIA_ROOT:-/Volumes/M4Drive/media}"
 MAKEMKVCON="/Applications/MakeMKV.app/Contents/MacOS/makemkvcon"
 HANDBRAKE="$HOME/bin/HandBrakeCLI"
 MIN_MOVIE_SECONDS=600

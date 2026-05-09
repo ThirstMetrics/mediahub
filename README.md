@@ -24,23 +24,35 @@ for f in ~/Mediahub/bin/*; do
   [[ -e "$HOME/bin/$name" ]] || ln -s "$f" "$HOME/bin/$name"
 done
 
-# 3. Install heavy tooling (these stay in ~/bin, not in the repo — too large)
-brew install handbrake ffmpeg
-ln -s "$(which HandBrakeCLI)" ~/bin/HandBrakeCLI
-ln -s "$(which ffprobe)"     ~/bin/ffprobe
-ln -s "$(which ffmpeg)"      ~/bin/ffmpeg
+# 3. Install heavy tooling — direct downloads, not brew (brew is unreliable on this fleet)
+#    HandBrakeCLI:
+curl -L -o /tmp/handbrake.dmg \
+  "https://github.com/HandBrake/HandBrake/releases/download/1.11.1/HandBrakeCLI-1.11.1.dmg"
+hdiutil attach /tmp/handbrake.dmg -nobrowse -quiet
+cp /Volumes/HandBrake*/HandBrakeCLI ~/bin/HandBrakeCLI
+chmod +x ~/bin/HandBrakeCLI
+hdiutil detach /Volumes/HandBrake* -quiet
 
-# 4. MakeMKV — drag from https://www.makemkv.com to /Applications
+#    ffmpeg (Apple Silicon — adjust URL for Intel from https://www.osxexperts.net/):
+curl -L -o /tmp/ffmpeg.zip "https://www.osxexperts.net/ffmpeg81arm.zip"
+unzip -o /tmp/ffmpeg.zip -d /tmp && mv /tmp/ffmpeg ~/bin/ffmpeg
+chmod +x ~/bin/ffmpeg
 
-# 5. State + log dirs
+#    MakeMKV (drag-install GUI app):
+curl -L -o /tmp/makemkv.dmg "https://www.makemkv.com/download/makemkv_v1.18.3_osx.dmg"
+hdiutil attach /tmp/makemkv.dmg -nobrowse -quiet
+cp -R /Volumes/makemkv*/MakeMKV.app /Applications/
+hdiutil detach /Volumes/makemkv* -quiet
+
+# 4. State + log dirs
 mkdir -p ~/.mediahub/state ~/.mediahub/logs
 
-# 6. Optional — install launchd agents for fire-and-forget auto-rip on disc insert
+# 5. Optional — install launchd agents for fire-and-forget auto-rip on disc insert
 cp ~/Mediahub/launchd/com.mediahub.{discwatcher,dvdkiller}.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mediahub.discwatcher.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mediahub.dvdkiller.plist
 
-# 7. Optional — disable macOS DVD Player autoplay (recipe near bottom of this README)
+# 6. Optional — disable macOS DVD Player autoplay (recipe near bottom of this README)
 ```
 
 ## External dependencies (paths the scripts assume)
@@ -52,9 +64,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mediahub.dvdkiller.p
 
 ## MEDIA_ROOT
 
-`bin/rip` writes to `/Volumes/M4Drive/media`. On a machine without that volume, either:
-- Rename your scratch USB drive to `M4Drive` in Disk Utility, or
-- Edit `MEDIA_ROOT` at the top of `bin/rip`.
+`bin/rip` defaults to `/Volumes/M4Drive/media` but is **env-var overridable**. Choose one:
+
+- Rename your scratch USB drive to `M4Drive` in Disk Utility (matches Mac Mini layout, no env needed), or
+- `export MEDIA_ROOT=~/MediaRips` in your shell, or
+- Inline: `MEDIA_ROOT=~/MediaRips ~/Mediahub/bin/rip movie "Heat (1995)"`
+
+Mac Mini behavior is unchanged when no override is set.
 
 ## Quality
 
