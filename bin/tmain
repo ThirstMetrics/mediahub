@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# tmain — attach to a persistent tmux session named "main", create if missing.
+# This is what you want to type after SSHing in: it picks up whatever you were
+# doing last time, and Wi-Fi drops don't kill your work.
+exec tmux new-session -A -s main "$@"

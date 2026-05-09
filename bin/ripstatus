@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# ripstatus — Show current rip/transcode progress
+# Usage: ripstatus          (one-shot)
+#        ripstatus watch    (live refresh every 5s)
+
+LOG="$HOME/.mediahub/logs/discwatcher.log"
+
+strip_ansi() {
+    sed 's/\x1b\[[0-9;]*m//g' | sed 's/\[3[0-9]m//g; s/\[0m//g'
+}
+
+# Get the most recent rip session (from last "DVD/BD detected" line)
+get_session_log() {
+    local start_line
+    start_line=$(grep -n "DVD/BD detected\|Audio CD detected" "$LOG" 2>/dev/null | tail -1 | cut -d: -f1)
+    if [[ -n "$start_line" ]]; then
+        tail -n +"$start_line" "$LOG" 2>/dev/null | strip_ansi
+    fi
+}
+
+show_status() {
+    MAKEMKV_PID=$(pgrep -f "makemkvcon mkv" 2>/dev/null | head -1)
+    HB_PID=$(pgrep -f "HandBrakeCLI" 2>/dev/null | head -1)
+    RIP_PID=$(pgrep -f "bin/rip" 2>/dev/null | head -1)
+
+    SESSION=$(get_session_log)
+
+    if [[ -z "$MAKEMKV_PID" && -z "$HB_PID" && -z "$RIP_PID" ]]; then
+        # Show last completed rip if available
+        if [[ -n "$SESSION" ]]; then
+            LAST_DONE=$(echo "$SESSION" | grep -E "^Done!|Rip completed|Rip failed" | tail -1)
+            if [[ -n "$LAST_DONE" ]]; then
+                echo "No rip in progress."
+                echo "  Last: $LAST_DONE"
+                return
+            fi
+        fi
+        echo "No rip in progress."
+        return
+    fi
+
+    # Parse current session for metadata
+    DISC_NAME=$(echo "$SESSION" | grep "^Disc:" | tail -1 | sed 's/Disc: //; s/ (.*//')
+    TITLE_NAME=$(echo "$SESSION" | grep "^Name:" | tail -1 | sed 's/Name: //')
+    SHOW_NAME="${TITLE_NAME:-$DISC_NAME}"
+    SEASON=$(echo "$SESSION" | grep "^Season:" | tail -1 | sed 's/Season: //')
+    DISC_TYPE=$(echo "$SESSION" | grep "^Type:" | tail -1 | sed 's/Type: //')
+    EP_COUNT=$(echo "$SESSION" | grep "^Confirmed:" | tail -1 | grep -oE '[0-9]+' | head -1)
+    CONTINUING=$(echo "$SESSION" | grep "Continuing from episode" | tail -1 | grep -oE '[0-9]+')
+
+    # Current episode being processed
+    CURRENT_EP=$(echo "$SESSION" | grep -E "^\[E[0-9]" | tail -1 | grep -oE 'E[0-9]+' | head -1)
+    CURRENT_PHASE=$(echo "$SESSION" | grep -E "^\[E[0-9]" | tail -1 | sed 's/.*\] //')
+
+    # Episodes completed this session
+    DONE_EPS=$(echo "$SESSION" | grep -c "Done (" 2>/dev/null || true)
+    DONE_EPS="${DONE_EPS:-0}"
+    DONE_EPS=$(echo "$DONE_EPS" | tr -d '[:space:]')
+
+    # ── MakeMKV rip phase ──
+    if [[ -n "$MAKEMKV_PID" ]]; then
+        ELAPSED=$(ps -o etime= -p "$MAKEMKV_PID" 2>/dev/null | xargs)
+        # Get the output dir from the MakeMKV command (path may contain spaces)
+        MKV_DIR=$(ps -o args= -p "$MAKEMKV_PID" 2>/dev/null | sed -n 's|.*/tmp/mediahub_rip/|/tmp/mediahub_rip/|p' | sed 's/ --.*$//')
+        MKV_SIZE=""
+        if [[ -n "$MKV_DIR" && -d "$MKV_DIR" ]]; then
+            MKV_SIZE=$(du -sh "$MKV_DIR" 2>/dev/null | cut -f1)
+        fi
+
+        echo "RIPPING: $SHOW_NAME"
+        [[ -n "$DISC_TYPE" ]] && echo "  Type:     $DISC_TYPE"
+        [[ -n "$SEASON" ]] && echo "  Season:   $SEASON"
+        [[ -n "$CURRENT_EP" ]] && echo "  Episode:  $CURRENT_EP"
+        [[ -n "$EP_COUNT" ]] && echo "  Total:    $EP_COUNT episodes ($DONE_EPS done)"
+        echo "  Size:     ${MKV_SIZE:-starting...}"
+        echo "  Elapsed:  $ELAPSED"
+        return
+    fi
+
+    # ── HandBrake transcode phase ──
+    if [[ -n "$HB_PID" ]]; then
+        ELAPSED=$(ps -o etime= -p "$HB_PID" 2>/dev/null | xargs)
+        HB_CMD=$(ps -o args= -p "$HB_PID" 2>/dev/null)
+        # Parse -o and -i paths (may contain spaces, end at next flag)
+        HB_OUTPUT=$(echo "$HB_CMD" | sed -n 's|.*-o \(/[^ -][^ ]*\( [^ -][^ ]*\)*\).*|\1|p')
+        HB_INPUT=$(echo "$HB_CMD" | sed -n 's|.*-i \(/[^ -][^ ]*\( [^ -][^ ]*\)*\).*|\1|p')
+        HB_FILENAME=$(basename "$HB_OUTPUT" 2>/dev/null)
+        HB_SIZE=$(du -sh "$HB_OUTPUT" 2>/dev/null | cut -f1)
+
+        # Source MKV for progress estimate
+        SRC_SIZE=$(stat -f%z "$HB_INPUT" 2>/dev/null || echo 0)
+        OUT_SIZE=$(stat -f%z "$HB_OUTPUT" 2>/dev/null || echo 0)
+
+        echo "TRANSCODING: $SHOW_NAME"
+        [[ -n "$DISC_TYPE" ]] && echo "  Type:     $DISC_TYPE"
+        [[ -n "$SEASON" ]] && echo "  Season:   $SEASON"
+        [[ -n "$CURRENT_EP" ]] && echo "  Episode:  $CURRENT_EP"
+        [[ -n "$EP_COUNT" ]] && echo "  Total:    $EP_COUNT episodes ($DONE_EPS done)"
+        echo "  File:     $HB_FILENAME"
+        echo "  Size:     ${HB_SIZE:-starting...}"
+        echo "  Elapsed:  $ELAPSED"
+
+        # Progress: try real HandBrake % from log, fall back to file-size estimate
+        # HandBrake uses \r (carriage return) for progress — split to lines first
+        HB_PROGRESS=$(tail -5 "$LOG" 2>/dev/null | tr '\r' '\n' | strip_ansi | grep -oE 'Encoding: task [0-9]+ of [0-9]+, [0-9.]+ %' | tail -1)
+        HB_ETA=$(tail -5 "$LOG" 2>/dev/null | tr '\r' '\n' | strip_ansi | grep -oE 'ETA [0-9h]+[0-9m]+[0-9s]+' | tail -1)
+        if [[ -n "$HB_PROGRESS" ]]; then
+            PCT=$(echo "$HB_PROGRESS" | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)
+            PCT="${PCT:-0}"
+            FILLED=$((PCT / 5))
+            EMPTY=$((20 - FILLED))
+            BAR=$(printf "%${FILLED}s" | tr ' ' '#')$(printf "%${EMPTY}s" | tr ' ' '-')
+            echo "  Progress: [$BAR] ${PCT}% ${HB_ETA}"
+        elif [[ "$SRC_SIZE" -gt 0 && "$OUT_SIZE" -gt 0 ]] 2>/dev/null; then
+            EST_FINAL=$((SRC_SIZE / 3))
+            if [[ "$EST_FINAL" -gt 0 ]]; then
+                PCT=$((OUT_SIZE * 100 / EST_FINAL))
+                [[ "$PCT" -gt 99 ]] && PCT=99
+                FILLED=$((PCT / 5))
+                EMPTY=$((20 - FILLED))
+                BAR=$(printf "%${FILLED}s" | tr ' ' '#')$(printf "%${EMPTY}s" | tr ' ' '-')
+                echo "  Progress: [$BAR] ~${PCT}%"
+            fi
+        fi
+        return
+    fi
+
+    # ── Copying phase or between phases ──
+    if [[ -n "$RIP_PID" ]]; then
+        ELAPSED=$(ps -o etime= -p "$RIP_PID" 2>/dev/null | xargs)
+        echo "RIP: $SHOW_NAME"
+        [[ -n "$DISC_TYPE" ]] && echo "  Type:     $DISC_TYPE"
+        [[ -n "$SEASON" ]] && echo "  Season:   $SEASON"
+        [[ -n "$CURRENT_EP" ]] && echo "  Episode:  $CURRENT_EP"
+        echo "  Phase:    ${CURRENT_PHASE:-Preparing}"
+        echo "  Elapsed:  $ELAPSED"
+    fi
+}
+
+if [[ "${1:-}" == "watch" ]]; then
+    while true; do
+        clear
+        echo "=== Rip Status — $(date '+%H:%M:%S') ==="
+        echo ""
+        show_status
+        echo ""
+        echo "(refreshing every 5s, Ctrl-C to stop)"
+        sleep 5
+    done
+else
+    show_status
+fi

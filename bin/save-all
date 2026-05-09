@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# save-all — auto-commit + push allowlisted repos.
+# Run this before walking away from the machine.
+#
+# Allowlist: repos that are safe to auto-commit (no secrets, plain notes/configs).
+# Anything not on this list is left alone — git-audit will surface it for manual handling.
+
+set -u
+
+ALLOWLIST=(
+  "${HOME}/project-registry"
+)
+
+echo "save-all — $(date '+%Y-%m-%d %H:%M:%S')"
+echo
+
+for repo in "${ALLOWLIST[@]}"; do
+  if [ ! -d "${repo}/.git" ]; then
+    echo "  skip ${repo} — not a git repo"
+    continue
+  fi
+
+  cd "${repo}" || continue
+  rel="${repo/#$HOME/~}"
+
+  dirty="$(git status --porcelain | wc -l | tr -d ' ')"
+  ahead="$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)"
+
+  if [ "${dirty}" = "0" ] && [ "${ahead}" = "0" ]; then
+    echo "  ✓ ${rel} — clean"
+    continue
+  fi
+
+  echo "  → ${rel} — ${dirty} dirty, ${ahead} ahead"
+
+  if [ "${dirty}" != "0" ]; then
+    git add -A
+    git commit -m "Auto-save: $(date '+%Y-%m-%d %H:%M')" --quiet
+    echo "    committed ${dirty} files"
+  fi
+
+  if git push --quiet 2>&1; then
+    echo "    pushed"
+  else
+    echo "    PUSH FAILED — handle manually"
+  fi
+done
+
+echo
+echo "Done. Other repos with pending work — see git-state.md."

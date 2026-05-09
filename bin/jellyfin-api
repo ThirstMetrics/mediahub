@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# jellyfin-api — Jellyfin API helper for media hub operations
+#
+# Usage:
+#   jellyfin-api search "Poirot"              Search for items by name
+#   jellyfin-api search "Poirot" Episode       Search for episodes only
+#   jellyfin-api delete <item_id>              Delete a Jellyfin item (DB only, not files)
+#   jellyfin-api refresh <item_id>             Force metadata refresh on an item
+#   jellyfin-api scan                          Trigger full library scan
+#   jellyfin-api episodes "Poirot" 1           List all episodes for show season 1
+#   jellyfin-api cleanup "Poirot" 1            Delete all Jellyfin entries for show S01
+
+set -euo pipefail
+
+JELLYFIN_HOST="http://localhost:8096"
+TOKEN_FILE="$HOME/.jellyfin_token"
+
+red()   { echo -e "\033[31m$*\033[0m"; }
+green() { echo -e "\033[32m$*\033[0m"; }
+blue()  { echo -e "\033[34m$*\033[0m"; }
+
+if [[ ! -f "$TOKEN_FILE" ]]; then
+    red "No Jellyfin token found at $TOKEN_FILE"
+    exit 1
+fi
+TOKEN=$(cat "$TOKEN_FILE")
+AUTH="MediaBrowser Client=\"mediahub\", Device=\"Mac\", DeviceId=\"mediahub-cli\", Version=\"1.0\", Token=\"$TOKEN\""
+
+jf_curl() {
+    curl -s "$@" -H "Authorization: $AUTH"
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    search)
+        QUERY="${1:-}"
+        ITEM_TYPE="${2:-}"
+        [[ -z "$QUERY" ]] && { red "Usage: jellyfin-api search <query> [type]"; exit 1; }
+
+        URL="$JELLYFIN_HOST/Search/Hints?searchTerm=$(echo "$QUERY" | sed 's/ /%20/g')&limit=20"
+        [[ -n "$ITEM_TYPE" ]] && URL="${URL}&includeItemTypes=$ITEM_TYPE"
+
+        jf_curl "$URL" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for h in data.get('SearchHints', []):
+    item_type = h.get('Type', '')
+    name = h.get('Name', '')
+    series = h.get('SeriesName', '')
+    idx = h.get('IndexNumber', '')
+    parent_idx = h.get('ParentIndexNumber', '')
+    item_id = h.get('Id', '')
+
+    if item_type == 'Episode':
+        ep_label = f'S{parent_idx:02d}E{idx:02d}' if isinstance(parent_idx, int) and isinstance(idx, int) else ''
+        prefix = f'{series} {ep_label}' if series else ''
+        print(f'{item_id}  {item_type:10s}  {prefix} {name}')
+    else:
+        print(f'{item_id}  {item_type:10s}  {name}')
+"
+        ;;
+
+    delete)
+        ITEM_ID="${1:-}"
+        [[ -z "$ITEM_ID" ]] && { red "Usage: jellyfin-api delete <item_id>"; exit 1; }
+
+        blue "Deleting Jellyfin item $ITEM_ID..."
+        HTTP_CODE=$(jf_curl -o /dev/null -w "%{http_code}" -X DELETE "$JELLYFIN_HOST/Items/$ITEM_ID")
+        if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
+            green "Deleted item $ITEM_ID"
+        else
+            red "Failed to delete item (HTTP $HTTP_CODE)"
+            exit 1
+        fi
+        ;;
+
+    refresh)
+        ITEM_ID="${1:-}"
+        [[ -z "$ITEM_ID" ]] && { red "Usage: jellyfin-api refresh <item_id>"; exit 1; }
+
+        blue "Refreshing metadata for item $ITEM_ID..."
+        HTTP_CODE=$(jf_curl -o /dev/null -w "%{http_code}" -X POST \
+            "$JELLYFIN_HOST/Items/$ITEM_ID/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=FullRefresh&replaceAllMetadata=true&replaceAllImages=true")
+        if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
+            green "Refresh triggered for item $ITEM_ID"
+        else
+            red "Failed to refresh (HTTP $HTTP_CODE)"
+            exit 1
+        fi
+        ;;
+
+    scan)
+        blue "Triggering Jellyfin library scan..."
+        HTTP_CODE=$(jf_curl -o /dev/null -w "%{http_code}" -X POST "$JELLYFIN_HOST/Library/Refresh")
+        if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
+            green "Library scan triggered."
+        else
+            red "Failed to trigger scan (HTTP $HTTP_CODE)"
+            exit 1
+        fi
+        ;;
+
+    episodes)
+        SHOW_NAME="${1:-}"
+        SEASON_NUM="${2:-}"
+        [[ -z "$SHOW_NAME" ]] && { red "Usage: jellyfin-api episodes <show_name> [season]"; exit 1; }
+
+        # Find the series ID first
+        SERIES_ID=$(jf_curl "$JELLYFIN_HOST/Search/Hints?searchTerm=$(echo "$SHOW_NAME" | sed 's/ /%20/g')&includeItemTypes=Series&limit=1" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(d['SearchHints'][0]['Id'] if d.get('SearchHints') else '')" 2>/dev/null)
+
+        if [[ -z "$SERIES_ID" ]]; then
+            red "Series '$SHOW_NAME' not found"
+            exit 1
+        fi
+
+        # Get episodes
+        URL="$JELLYFIN_HOST/Items?parentId=$SERIES_ID&includeItemTypes=Episode&recursive=true&fields=Path,Overview&sortBy=SortName"
+        [[ -n "$SEASON_NUM" ]] && URL="${URL}&seasonId="
+
+        jf_curl "$URL" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+season_filter = ${SEASON_NUM:-0}
+for item in data.get('Items', []):
+    s = item.get('ParentIndexNumber', 0)
+    e = item.get('IndexNumber', 0)
+    if season_filter and s != season_filter:
+        continue
+    name = item.get('Name', '')
+    path = item.get('Path', '')
+    item_id = item.get('Id', '')
+    print(f'{item_id}  S{s:02d}E{e:02d}  {name}')
+    if path:
+        print(f'           {path}')
+"
+        ;;
+
+    cleanup)
+        SHOW_NAME="${1:-}"
+        SEASON_NUM="${2:-}"
+        [[ -z "$SHOW_NAME" ]] && { red "Usage: jellyfin-api cleanup <show_name> [season]"; exit 1; }
+
+        blue "Finding episodes to clean up..."
+        # Search for episodes
+        ITEMS=$(jf_curl "$JELLYFIN_HOST/Search/Hints?searchTerm=$(echo "$SHOW_NAME" | sed 's/ /%20/g')&includeItemTypes=Episode&limit=50" | \
+            python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+season_filter = ${SEASON_NUM:-0}
+for h in data.get('SearchHints', []):
+    s = h.get('ParentIndexNumber', 0)
+    if season_filter and s != season_filter:
+        continue
+    print(h['Id'])
+" 2>/dev/null)
+
+        if [[ -z "$ITEMS" ]]; then
+            blue "No episodes found for $SHOW_NAME${SEASON_NUM:+ Season $SEASON_NUM}"
+            exit 0
+        fi
+
+        COUNT=$(echo "$ITEMS" | wc -l | xargs)
+        blue "Deleting $COUNT episode entries..."
+
+        while IFS= read -r item_id; do
+            [[ -z "$item_id" ]] && continue
+            HTTP_CODE=$(jf_curl -o /dev/null -w "%{http_code}" -X DELETE "$JELLYFIN_HOST/Items/$item_id")
+            if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
+                green "  Deleted $item_id"
+            else
+                red "  Failed $item_id (HTTP $HTTP_CODE)"
+            fi
+        done <<< "$ITEMS"
+
+        green "Cleanup complete. Run 'jellyfin-api scan' to re-scrape."
+        ;;
+
+    help|*)
+        echo "jellyfin-api — Jellyfin API helper"
+        echo ""
+        echo "Commands:"
+        echo "  search <query> [type]         Search items (types: Series, Episode, Movie, Season)"
+        echo "  delete <item_id>              Delete a Jellyfin item"
+        echo "  refresh <item_id>             Force metadata refresh"
+        echo "  scan                          Trigger library scan"
+        echo "  episodes <show> [season]      List episodes for a show"
+        echo "  cleanup <show> [season]       Delete all Jellyfin entries for a show/season"
+        ;;
+esac

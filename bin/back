@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# back — graceful "I'm at the keyboard again" routine, mirror of `away`.
+# Pulls other machines' state from Nextcloud, fast-forwards every clean repo
+# that's behind upstream, re-audits, and re-syncs.
+
+set -u
+
+echo "back — $(date '+%Y-%m-%d %H:%M:%S')"
+echo
+
+HOSTNAME_SHORT="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+
+# Cache sudo creds upfront so the bandwidth-capture stop step doesn't prompt mid-script.
+if ! sudo -n true 2>/dev/null; then
+  echo "Some steps need sudo (stop overnight capture)."
+  sudo -v || { echo "(sudo declined — capture analysis will be skipped)"; }
+fi
+echo
+
+# ─────── 0. Stop overnight capture and analyze yesterday's traffic ───────
+echo "[0/7] overnight capture: stop + analyze"
+"${HOME}/bin/bandwidth-capture.sh" stop
+"${HOME}/bin/bandwidth-analyze.sh" 2>&1 | sed 's/^/    /' | head -50
+echo
+
+# ─────── 1. Sync FROM Nextcloud first so we see other machines' latest ───────
+echo "[1/7] nextcloud sync (pull)"
+"${HOME}/bin/nc-sync.sh" >/dev/null 2>&1
+LAST_RC="$(tail -1 "${HOME}/Library/Logs/nc-sync/sync.log" 2>/dev/null | grep -oE 'rc=[0-9]+')"
+echo "    sync ${LAST_RC:-unknown}"
+echo
+
+# ─────── 2. Fast-forward every clean repo that's behind upstream ───────
+echo "[2/7] git fetch + ff-pull"
+PULLED=0
+BLOCKED=0
+GIT_LIST="$(mktemp)"
+find -L "${HOME}" -maxdepth 4 -type d -name .git 2>/dev/null \
+  | grep -v -E '/(node_modules|venv|\.venv|vendor|\.tox|build|dist)/' \
+  | sort > "${GIT_LIST}"
+
+while IFS= read -r git_dir; do
+  repo_dir="$(dirname "${git_dir}")"
+  rel="${repo_dir/#$HOME/~}"
+
+  upstream="$(git -C "${repo_dir}" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo '')"
+  [ -z "${upstream}" ] && continue
+
+  git -C "${repo_dir}" fetch --quiet 2>/dev/null || { echo "    ✗ ${rel} — fetch failed"; continue; }
+
+  behind="$(git -C "${repo_dir}" rev-list --count "HEAD..${upstream}" 2>/dev/null || echo 0)"
+  [ "${behind}" = "0" ] && continue
+
+  dirty_count="$(git -C "${repo_dir}" status --porcelain 2>/dev/null | grep -v '^??' | wc -l | tr -d ' ')"
+  if [ "${dirty_count}" != "0" ]; then
+    echo "    ⚠ ${rel} — ${behind} behind but DIRTY, skipping"
+    BLOCKED=$((BLOCKED+1))
+    continue
+  fi
+
+  if git -C "${repo_dir}" pull --ff-only --quiet 2>/dev/null; then
+    echo "    ✓ ${rel} — pulled ${behind}"
+    PULLED=$((PULLED+1))
+  else
+    echo "    ✗ ${rel} — ff-pull failed (diverged, needs manual rebase)"
+    BLOCKED=$((BLOCKED+1))
+  fi
+done < "${GIT_LIST}"
+rm -f "${GIT_LIST}"
+echo "    pulled ${PULLED}, blocked ${BLOCKED}"
+echo
+
+# ─────── 3. Refresh git-state.md so server reflects this machine post-pull ───────
+echo "[3/7] git audit"
+"${HOME}/bin/git-audit.sh"
+SUMMARY="$(grep -m1 'need attention' "${HOME}/Nextcloud/_machines/${HOSTNAME_SHORT}/git-state.md" 2>/dev/null | sed 's/[*]//g')"
+echo "    ${SUMMARY:-(no summary)}"
+echo
+
+# ─────── 4. Sync TO Nextcloud so other machines see our refreshed state ───────
+echo "[4/7] nextcloud sync (push)"
+"${HOME}/bin/nc-sync.sh" >/dev/null 2>&1
+LAST_RC="$(tail -1 "${HOME}/Library/Logs/nc-sync/sync.log" 2>/dev/null | grep -oE 'rc=[0-9]+')"
+echo "    sync ${LAST_RC:-unknown}"
+echo
+
+# ─────── 5. Reopen Chrome (away quits it) ───────
+echo "[5/7] reopen Chrome"
+if pgrep -q "Google Chrome"; then
+  echo "    Chrome already running"
+else
+  open -a "Google Chrome"
+  echo "    Chrome launched"
+fi
+echo
+
+# ─────── 6. Report which services `away` disabled (intentionally LEFT off) ───────
+echo "[6/7] services left disabled (start manually if needed)"
+POWERNAP="$(pmset -g | awk '/powernap/ {print $2}')"
+[ "${POWERNAP}" = "0" ] && echo "    Power Nap: OFF (sudo pmset -a powernap 1 to re-enable)"
+pgrep -q "OneDrive" || echo "    OneDrive: not running (open -a OneDrive to restart)"
+pgrep -q "Docker" || echo "    Docker: not running (open -a 'Docker Desktop' to restart)"
+echo
+
+# ─────── 7. Start a fresh capture for today's day-bandwidth analysis ───────
+echo "[7/7] start daytime bandwidth capture"
+"${HOME}/bin/bandwidth-capture.sh" start
+echo
+
+echo "Done. Welcome back."

@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# ripcd — Rip an audio CD to MP3 with MusicBrainz metadata
+# Usage: ripcd                                    (auto-detect)
+#        ripcd "Artist" "Album"                   (manual override)
+#        ripcd "Artist" "Album" "MBID"            (with MusicBrainz album ID)
+
+set -uo pipefail
+MBID=""
+
+MEDIA_ROOT="/Volumes/M4Drive/media/music"
+FFMPEG="$HOME/bin/ffmpeg"
+LOG="$HOME/.mediahub/logs/ripcd.log"
+mkdir -p "$(dirname "$LOG")"
+
+red()   { echo -e "\033[31m$*\033[0m"; }
+green() { echo -e "\033[32m$*\033[0m"; }
+blue()  { echo -e "\033[34m$*\033[0m"; }
+
+log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
+
+# ── Kill existing rips ──
+EXISTING=$(pgrep -f "ffmpeg.*Audio CD|bin/ripcd" 2>/dev/null | grep -v "$$" || true)
+if [[ -n "$EXISTING" ]]; then
+    blue "Killing existing CD rips..."
+    echo "$EXISTING" | xargs kill -9 2>/dev/null
+fi
+
+[[ -x "$FFMPEG" ]] || { red "ffmpeg not found at $FFMPEG"; exit 1; }
+
+# ── Find audio CD volume ──
+blue "Looking for audio CD..."
+CD_VOL=""
+for v in /Volumes/*/; do
+    if ls "$v"*.aiff >/dev/null 2>&1 || ls "$v"*.cdda >/dev/null 2>&1; then
+        CD_VOL="${v%/}"
+        break
+    fi
+done
+
+if [[ -z "$CD_VOL" ]]; then
+    red "No audio CD detected. Insert a music CD and wait for it to mount."
+    exit 1
+fi
+
+CD_NAME=$(basename "$CD_VOL")
+green "Found: $CD_NAME at $CD_VOL"
+
+# ── Metadata lookup via MusicBrainz ──
+ARTIST="${1:-Unknown Artist}"
+ALBUM="${2:-$CD_NAME}"
+MBID="${3:-}"
+DISC="${4:-}"
+
+# Try to get disc ID and look up MusicBrainz
+if command -v drutil >/dev/null 2>&1; then
+    # macOS includes the CD's TOC in the volume name when burned with proper metadata
+    blue "Looking up metadata..."
+    # Use MusicBrainz CD lookup by track count and total length
+    TRACK_COUNT=$(ls "$CD_VOL"/*.aiff 2>/dev/null | wc -l | xargs)
+
+    # If no manual override, try to parse the CD volume name (often "Artist - Album")
+    if [[ "$ARTIST" == "Unknown Artist" && "$CD_NAME" == *" - "* ]]; then
+        ARTIST="${CD_NAME%% - *}"
+        ALBUM="${CD_NAME#* - }"
+    fi
+fi
+
+green "Artist: $ARTIST"
+green "Album:  $ALBUM"
+
+# ── Fetch tracklist from MusicBrainz if MBID provided ──
+declare -a MB_TITLES
+if [[ -n "$MBID" ]]; then
+    blue "Fetching tracklist from MusicBrainz..."
+    MB_DISC="${DISC:-1}"
+    MB_JSON=$(curl -s -A "MediaHub/1.0 (ripcd)" "https://musicbrainz.org/ws/2/release/$MBID?inc=recordings&fmt=json" 2>/dev/null)
+    if [[ -n "$MB_JSON" ]]; then
+        while IFS= read -r line; do
+            MB_TITLES+=("$line")
+        done < <(echo "$MB_JSON" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    target = int('$MB_DISC')
+    for m in d.get('media', []):
+        if m.get('position') == target:
+            for t in m.get('tracks', []):
+                print(t.get('title', ''))
+            break
+except: pass
+" 2>/dev/null)
+        if [[ ${#MB_TITLES[@]} -gt 0 ]]; then
+            green "Got ${#MB_TITLES[@]} track titles from MusicBrainz"
+        fi
+    fi
+fi
+
+# ── Rip ──
+if [[ -n "$DISC" ]]; then
+    DISC_PAD=$(printf "%02d" "$DISC")
+    DEST_DIR="$MEDIA_ROOT/$ARTIST/$ALBUM/Disc $DISC_PAD"
+else
+    DEST_DIR="$MEDIA_ROOT/$ARTIST/$ALBUM"
+fi
+STAGE_DIR="/tmp/mediahub_cdrip"
+rm -rf "$STAGE_DIR"
+mkdir -p "$STAGE_DIR"
+
+osascript -e "display notification \"Ripping: $ARTIST - $ALBUM\" with title \"CD Rip\" sound name \"Submarine\"" 2>/dev/null || true
+
+TOTAL=$(ls "$CD_VOL"/*.aiff 2>/dev/null | wc -l | xargs)
+blue "Ripping $TOTAL tracks sequentially..."
+
+TRACK_NUM=1
+for aiff in "$CD_VOL"/*.aiff; do
+    [[ -f "$aiff" ]] || continue
+    TRACK_PAD=$(printf "%02d" "$TRACK_NUM")
+    # Prefer MusicBrainz title, fall back to AIFF filename, then "Track NN"
+    if [[ ${#MB_TITLES[@]} -ge $TRACK_NUM ]]; then
+        TRACK_TITLE="${MB_TITLES[$((TRACK_NUM-1))]}"
+    else
+        BASENAME=$(basename "$aiff" .aiff)
+        TRACK_TITLE=$(echo "$BASENAME" | sed 's/^[0-9]* *//')
+        [[ -z "$TRACK_TITLE" || "$TRACK_TITLE" == "Audio Track" ]] && TRACK_TITLE="Track $TRACK_PAD"
+    fi
+    # Sanitize for filename (no slashes)
+    SAFE_TITLE=$(echo "$TRACK_TITLE" | tr '/' '-')
+    OUT="$STAGE_DIR/${TRACK_PAD} - ${SAFE_TITLE}.mp3"
+
+    blue "  Track $TRACK_NUM/$TOTAL: $TRACK_TITLE"
+    META_ARGS=()
+    [[ -n "${MBID:-}" ]] && META_ARGS+=(-metadata "MUSICBRAINZ_ALBUMID=$MBID")
+    [[ -n "${DISC:-}" ]] && META_ARGS+=(-metadata "disc=$DISC")
+    "$FFMPEG" -i "$aiff" -codec:a libmp3lame -qscale:a 0 \
+        -metadata title="$TRACK_TITLE" \
+        -metadata artist="$ARTIST" \
+        -metadata album_artist="$ARTIST" \
+        -metadata album="$ALBUM" \
+        -metadata track="$TRACK_NUM/$TOTAL" \
+        "${META_ARGS[@]}" \
+        "$OUT" -y 2>/dev/null || red "  Failed track $TRACK_NUM"
+
+    TRACK_NUM=$((TRACK_NUM + 1))
+done
+
+# ── Move to destination ──
+mkdir -p "$DEST_DIR" 2>/dev/null
+cp "$STAGE_DIR"/*.mp3 "$DEST_DIR/" 2>/dev/null
+rm -rf "$STAGE_DIR"
+
+COUNT=$(ls "$DEST_DIR"/*.mp3 2>/dev/null | wc -l | xargs)
+SIZE=$(du -sh "$DEST_DIR" 2>/dev/null | cut -f1)
+
+green "Ripped $COUNT track(s) to $DEST_DIR ($SIZE)"
+
+# ── Eject ──
+diskutil eject "$CD_VOL" 2>/dev/null || drutil eject 2>/dev/null
+green "CD ejected."
+
+# ── Jellyfin scan ──
+JELLYFIN_TOKEN=$(cat "$HOME/.jellyfin_token" 2>/dev/null || echo "")
+if [[ -n "$JELLYFIN_TOKEN" ]]; then
+    curl -s -X POST "http://localhost:8096/Library/Refresh" \
+        -H "X-Emby-Authorization: MediaBrowser Client=\"ripcd\", Device=\"Mac\", DeviceId=\"ripcd1\", Version=\"1.0\", Token=\"$JELLYFIN_TOKEN\"" \
+        >/dev/null 2>&1 && blue "Jellyfin scan triggered."
+fi
+
+osascript -e "display notification \"$ARTIST - $ALBUM ($COUNT tracks)\" with title \"CD Rip Complete\" sound name \"Glass\"" 2>/dev/null || true
+green "Done!"

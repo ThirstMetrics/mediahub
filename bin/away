@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# away — graceful "I'm walking away from this machine" routine.
+# Saves state, syncs, kills idle bandwidth hogs, reports what's still chewing bandwidth.
+
+set -u
+
+echo "away — $(date '+%Y-%m-%d %H:%M:%S')"
+echo
+
+# Cache sudo creds upfront so the steps that need root (Power Nap toggle,
+# tcpdump capture) don't prompt mid-script. Skip if already cached.
+if ! sudo -n true 2>/dev/null; then
+  echo "Some steps need sudo (Power Nap toggle, packet capture)."
+  sudo -v || { echo "(sudo declined — bandwidth steps will be skipped)"; }
+fi
+echo
+
+# ─────── 1. Save: commit + push allowlisted repos ───────
+echo "[1/7] save-all"
+"${HOME}/bin/save-all" 2>&1 | sed 's/^/    /'
+echo
+
+# ─────── 2. Refresh git-state.md so other machines see latest ───────
+echo "[2/7] git audit"
+"${HOME}/bin/git-audit.sh"
+HOSTNAME_SHORT="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+NEEDS="$(grep -m1 'need attention' "${HOME}/Nextcloud/_machines/${HOSTNAME_SHORT}/git-state.md" 2>/dev/null \
+  | grep -oE '^[0-9]+|of [0-9]+ ' | head -1)"
+SUMMARY="$(grep -m1 'need attention' "${HOME}/Nextcloud/_machines/${HOSTNAME_SHORT}/git-state.md" 2>/dev/null | sed 's/[*]//g')"
+echo "    ${SUMMARY:-(no summary)}"
+echo
+
+# ─────── 3. Sync to Nextcloud so latest state is on the server ───────
+echo "[3/7] nextcloud sync"
+"${HOME}/bin/nc-sync.sh" >/dev/null 2>&1
+LAST_RC="$(tail -1 "${HOME}/Library/Logs/nc-sync/sync.log" 2>/dev/null | grep -oE 'rc=[0-9]+')"
+echo "    sync ${LAST_RC:-unknown}"
+echo
+
+# ─────── 4. Quit known bandwidth hogs: Chrome, OneDrive, Docker ───────
+echo "[4/7] quit bandwidth hogs"
+for app in "Google Chrome" "OneDrive" "Docker Desktop" "Docker"; do
+  if pgrep -q "${app}"; then
+    osascript -e "tell application \"${app}\" to quit" 2>/dev/null
+    sleep 2
+    if pgrep -q "${app}"; then
+      echo "    ⚠ ${app} refused to quit — left running"
+    else
+      echo "    ✓ ${app} quit"
+    fi
+  fi
+done
+echo
+
+# ─────── 5. Disable Power Nap so the mini doesn't sync overnight ───────
+echo "[5/7] disable Power Nap (no overnight Apple downloads)"
+if sudo -n pmset -a powernap 0 2>/dev/null; then
+  CURRENT="$(pmset -g | awk '/powernap/ {print $2}')"
+  echo "    powernap=${CURRENT}"
+else
+  echo "    skipped (sudo not cached)"
+fi
+echo
+
+# ─────── 6. Start overnight bandwidth capture for tomorrow's analysis ───────
+echo "[6/7] start overnight bandwidth capture"
+"${HOME}/bin/bandwidth-capture.sh" start
+echo
+
+# ─────── 7. Report what's still chewing bandwidth ───────
+echo "[7/7] still running (decide if you want these on while away)"
+
+JF_PIDS="$(pgrep -f 'Jellyfin' | head -3)"
+[ -n "${JF_PIDS}" ] && echo "    ⚠ Jellyfin running (will serve streams to anyone connected) — pkill -f Jellyfin to stop"
+
+KALSHI_PIDS="$(pgrep -f 'main.py.*bankroll')"
+[ -n "${KALSHI_PIDS}" ] && echo "    ⚠ Kalshi bot running (PID ${KALSHI_PIDS}) — pkill -f 'main.py.*bankroll' to stop"
+
+CRD_PIDS="$(pgrep -f 'remoting_me2me_host\|chrome_remote_desktop' | head -3)"
+[ -n "${CRD_PIDS}" ] && echo "    ⚠ Chrome Remote Desktop host still running"
+
+CURSOR_PIDS="$(pgrep -f 'Cursor' | head -3)"
+[ -n "${CURSOR_PIDS}" ] && echo "    ◦ Cursor IDE running (low bandwidth, leave it)"
+
+# Today's burn so far
+"${HOME}/bin/nethog.sh" >/dev/null 2>&1
+TODAY_LINE="$(grep -m1 '^## .*Today:' "${HOME}/Nextcloud/_machines/${HOSTNAME_SHORT}/bandwidth.md" 2>/dev/null \
+  | sed 's/^## //; s/[⚠️]//g; s/^[[:space:]]*//')"
+echo
+echo "    ${TODAY_LINE}"
+echo
+echo "Done. Safe to walk away."

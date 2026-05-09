@@ -1,0 +1,761 @@
+#!/usr/bin/env bash
+# rip — One-command DVD rip + transcode + organize for Jellyfin
+#
+# Usage:
+#   rip                          GUI dialogs for type, name, season
+#   rip movie "Movie Name"       Rip as movie (skip dialogs)
+#   rip tv "Show Name" 2         Rip as TV, season 2 (skip dialogs)
+#   rip eject                    Just eject the disc
+#
+# macOS GUI dialogs (osascript) pop up for every decision unless ALL args
+# are explicitly provided. Works from both terminal and launchd disc watcher.
+#
+# Output goes to /Volumes/M4Drive/media/movies or /tvshows
+# Files are transcoded to MP4 (x264) for maximum Jellyfin compatibility.
+
+set -euo pipefail
+
+MEDIA_ROOT="/Volumes/M4Drive/media"
+MAKEMKVCON="/Applications/MakeMKV.app/Contents/MacOS/makemkvcon"
+HANDBRAKE="$HOME/bin/HandBrakeCLI"
+MIN_MOVIE_SECONDS=600
+MIN_TV_SECONDS=120
+QUALITY=14   # HandBrake CRF; lower = higher quality, larger file. Per-disc override via dialog.
+
+red()   { echo -e "\033[31m$*\033[0m"; }
+green() { echo -e "\033[32m$*\033[0m"; }
+blue()  { echo -e "\033[34m$*\033[0m"; }
+
+# ── Eject shortcut ──────────────────────────────────────────────────────────
+if [[ "${1:-}" == "eject" ]]; then
+    drutil eject 2>/dev/null && green "Disc ejected." || red "No disc to eject."
+    exit 0
+fi
+
+# ── Kill any existing rip processes ─────────────────────────────────────────
+MY_PID=$$
+PARENT_PID=$PPID
+EXISTING=$(pgrep -f "makemkvcon|HandBrakeCLI" 2>/dev/null | grep -v "^$MY_PID$" | grep -v "^$PARENT_PID$" || true)
+if [[ -n "$EXISTING" ]]; then
+    blue "Killing existing rip processes..."
+    echo "$EXISTING" | xargs kill 2>/dev/null || true
+    sleep 2
+    echo "$EXISTING" | xargs kill -9 2>/dev/null || true
+    rm -f /tmp/autorip.lock || true
+    rm -rf /tmp/mediahub_rip/* 2>/dev/null || true
+    rm -rf /tmp/mediahub_transcode/* 2>/dev/null || true
+fi
+
+# ── Check tools ─────────────────────────────────────────────────────────────
+[[ -x "$MAKEMKVCON" ]] || { red "MakeMKV not found."; exit 1; }
+[[ -x "$HANDBRAKE" ]] || { red "HandBrakeCLI not found at $HANDBRAKE"; exit 1; }
+[[ -d "$MEDIA_ROOT" ]] || { red "M4Drive not mounted."; exit 1; }
+
+# ── Clean up old rip/transcode directories ─────────────────────────────────
+# Remove previous session's temp files to avoid stale MKVs causing corruption
+rm -rf /tmp/mediahub_rip/* 2>/dev/null
+rm -rf /tmp/mediahub_transcode/* 2>/dev/null
+
+# ── Detect disc ─────────────────────────────────────────────────────────────
+blue "Scanning disc..."
+# Run disc scan with 120s timeout (MakeMKV can hang on bad drives)
+DISC_INFO_TMP="/tmp/mediahub_disc_scan.$$"
+"$MAKEMKVCON" -r info disc:0 >"$DISC_INFO_TMP" 2>/dev/null &
+SCAN_PID=$!
+SCAN_WAIT=0
+while kill -0 "$SCAN_PID" 2>/dev/null; do
+    sleep 1
+    SCAN_WAIT=$((SCAN_WAIT + 1))
+    if [[ $SCAN_WAIT -ge 300 ]]; then
+        kill "$SCAN_PID" 2>/dev/null; kill -9 "$SCAN_PID" 2>/dev/null
+        rm -f "$DISC_INFO_TMP"
+        red "Disc scan timed out (5min). Drive may be stuck."
+        exit 1
+    fi
+done
+wait "$SCAN_PID" 2>/dev/null
+DISC_INFO=$(cat "$DISC_INFO_TMP" 2>/dev/null)
+rm -f "$DISC_INFO_TMP"
+DISC_NAME=$(echo "$DISC_INFO" | grep "^DRV:0" | tail -1 | cut -d',' -f6 | tr -d '"\r\n')
+
+if [[ -z "$DISC_NAME" ]]; then
+    red "No disc detected. Insert a DVD and try again."
+    exit 1
+fi
+
+# Count titles
+TITLE_LINES=$(echo "$DISC_INFO" | grep "^MSG:3028" || true)
+TITLE_COUNT=$(echo "$TITLE_LINES" | grep -c "." || true)
+TITLE_COUNT="${TITLE_COUNT:-0}"
+
+green "Disc: $DISC_NAME ($TITLE_COUNT titles found)"
+
+# Notification: rip starting
+osascript -e "display notification \"Starting rip: $DISC_NAME\" with title \"DVD Rip\" sound name \"Submarine\"" 2>/dev/null || true
+
+# ── Parse args ────────────────────────────────────────────────────────────
+TYPE="${1:-}"
+NAME_ARG="${2:-}"
+SEASON_ARG="${3:-}"
+
+# SKIP_PROMPT: only when all args are explicitly provided
+# e.g. "rip tv 'Show Name' 2" — that's a fully scripted call, no dialogs.
+# Anything else (rip, rip auto, rip movie, rip tv) gets dialogs.
+SKIP_PROMPT=false
+if [[ "$TYPE" == "movie" && -n "$NAME_ARG" ]]; then
+    SKIP_PROMPT=true
+elif [[ "$TYPE" == "tv" && -n "$NAME_ARG" && -n "$SEASON_ARG" ]]; then
+    SKIP_PROMPT=true
+fi
+
+# Clean disc name: split CamelCase, replace underscores, dedupe spaces
+CLEAN_NAME=$(echo "$DISC_NAME" | sed 's/_/ /g' | sed 's/  */ /g' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1' || echo "$DISC_NAME")
+
+# Detect season/disc hints in the volume label (e.g., S01_D02, SEASON_1_DISC_2)
+DETECTED_SEASON=$(echo "$DISC_NAME" | grep -oE '(SEASON[_ ]*|S)[0-9]+' 2>/dev/null | head -1 | grep -oE '[0-9]+' 2>/dev/null || true)
+DETECTED_DISC=$(echo "$DISC_NAME" | grep -oE '(DISC[_ ]*|D)[0-9]+' 2>/dev/null | head -1 | grep -oE '[0-9]+' 2>/dev/null || true)
+
+# Strip season/disc info from clean name for TMDB lookup
+SEARCH_NAME=$(echo "$CLEAN_NAME" | sed -E 's/[Ss]eries *[0-9]+//gi; s/[Ss]eason *[0-9]+//gi; s/[Dd]isc *[0-9]+//gi; s/[Ss][0-9]+[Dd][0-9]+//g; s/ [Dd][0-9]+$//g; s/ [Dd][0-9]+ / /g; s/  */ /g; s/^[[:space:]]*//; s/[[:space:]]*$//' || echo "$CLEAN_NAME")
+
+# Count long titles for auto-detect suggestion
+LONG_TITLES=$(echo "$DISC_INFO" | grep "^TINFO:" | grep ",9,0," | awk -F',' '{gsub(/"/, "", $NF); split($NF, t, ":"); secs=t[1]*3600+t[2]*60+t[3]; if(secs>=1200) print}' | wc -l | xargs)
+
+# ── Title summary (always shown) ─────────────────────────────────────────
+echo ""
+echo "  Disc label:    $DISC_NAME"
+echo "  Total titles:  $TITLE_COUNT"
+echo "  Titles > 20m:  $LONG_TITLES"
+[[ -n "$DETECTED_SEASON" ]] && echo "  Season hint:   $DETECTED_SEASON"
+[[ -n "$DETECTED_DISC" ]]   && echo "  Disc hint:     $DETECTED_DISC"
+echo ""
+
+# Show title durations for context
+echo "$DISC_INFO" | grep "^TINFO:" | grep ",9,0," | python3 -c "
+import sys, re
+titles = []
+for line in sys.stdin:
+    m = re.match(r'TINFO:(\d+),9,0,\"(.*)\"', line.strip())
+    if m:
+        tid, dur = int(m.group(1)), m.group(2)
+        parts = dur.split(':')
+        secs = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+        titles.append((tid, dur, secs))
+for tid, dur, secs in sorted(titles):
+    bar = '#' * (secs // 120)  # 1 hash per 2 minutes
+    label = 'SHORT' if secs < 600 else ''
+    print(f'  Title {tid:2d}: {dur:>8s}  {bar} {label}')
+" 2>/dev/null
+echo ""
+
+# ── Ask type (GUI dialog unless fully scripted) ──────────────────────────
+if [[ "$SKIP_PROMPT" == "false" && ( -z "$TYPE" || "$TYPE" == "auto" ) ]]; then
+    # Query TMDB for both movie and TV, score by title match + popularity
+    TMDB_KEY_CHECK="8265bd1679663a7ea12ac168da84d2e8"
+    TMDB_QUERY=$(echo "$SEARCH_NAME" | sed 's/ /+/g')
+    curl -s --max-time 5 "https://api.themoviedb.org/3/search/movie?api_key=$TMDB_KEY_CHECK&query=$TMDB_QUERY" > /tmp/mediahub_tmdb_m.json 2>/dev/null || echo '{}' > /tmp/mediahub_tmdb_m.json
+    curl -s --max-time 5 "https://api.themoviedb.org/3/search/tv?api_key=$TMDB_KEY_CHECK&query=$TMDB_QUERY" > /tmp/mediahub_tmdb_t.json 2>/dev/null || echo '{}' > /tmp/mediahub_tmdb_t.json
+
+    # Score each: title match quality matters more than raw popularity
+    TMDB_PICK=$(python3 -c "
+import json, re
+
+query = '$SEARCH_NAME'.lower().strip()
+def norm(s):
+    return re.sub(r'[^a-z0-9 ]', '', s.lower()).strip()
+
+def score(results, key):
+    if not results:
+        return 0, ''
+    r = results[0]
+    title = norm(r.get(key, ''))
+    q = norm(query)
+    pop = r.get('popularity', 0)
+    # Title match bonus: exact=100, contains=50, partial word=10
+    if title == q or q == title:
+        match = 100
+    elif q in title or title in q:
+        match = 50
+    elif set(q.split()) & set(title.split()):
+        match = 10
+    else:
+        match = 0
+    return match + min(pop, 50), r.get(key, '')
+
+with open('/tmp/mediahub_tmdb_m.json') as f: m_data = json.load(f)
+with open('/tmp/mediahub_tmdb_t.json') as f: t_data = json.load(f)
+
+m_score, m_name = score(m_data.get('results', []), 'title')
+t_score, t_name = score(t_data.get('results', []), 'name')
+
+best = max(m_score, t_score)
+if best < 30:
+    print(f'unknown|{int(m_score)}|{int(t_score)}|{m_name}|{t_name}')
+elif t_score > m_score:
+    print(f'tv|{int(m_score)}|{int(t_score)}|{m_name}|{t_name}')
+elif m_score > t_score:
+    print(f'movie|{int(m_score)}|{int(t_score)}|{m_name}|{t_name}')
+else:
+    print(f'unknown|{int(m_score)}|{int(t_score)}|{m_name}|{t_name}')
+" 2>/dev/null || echo "unknown|0|0||")
+    rm -f /tmp/mediahub_tmdb_m.json /tmp/mediahub_tmdb_t.json
+
+    TMDB_TYPE_GUESS=$(echo "$TMDB_PICK" | cut -d'|' -f1)
+    TMDB_M_SCORE=$(echo "$TMDB_PICK" | cut -d'|' -f2)
+    TMDB_T_SCORE=$(echo "$TMDB_PICK" | cut -d'|' -f3)
+
+    case "$TMDB_TYPE_GUESS" in
+        tv)     DEFAULT_BTN="TV Series" ;;
+        movie)  DEFAULT_BTN="Movie" ;;
+        *)
+            if [[ $LONG_TITLES -gt 3 ]]; then
+                DEFAULT_BTN="TV Series"
+            else
+                DEFAULT_BTN="Movie"
+            fi
+            ;;
+    esac
+
+    SAFE_DISC_AS=$(echo "$DISC_NAME" | sed 's/"/\\"/g')
+    TMDB_HINT=""
+    if [[ "$TMDB_M_SCORE" -gt 0 || "$TMDB_T_SCORE" -gt 0 ]] 2>/dev/null; then
+        TMDB_HINT=" (TMDB: movie=${TMDB_M_SCORE}, tv=${TMDB_T_SCORE})"
+    fi
+    TYPE_CHOICE=$(osascript \
+        -e "display dialog \"Disc: ${SAFE_DISC_AS}\" & return & \"${TITLE_COUNT} titles, ${LONG_TITLES} over 20 min\" & return & return & \"Suggestion: ${DEFAULT_BTN}${TMDB_HINT}\" buttons {\"Eject\", \"TV Series\", \"Movie\"} default button \"${DEFAULT_BTN}\" with title \"Media Hub\" with icon caution" \
+        -e 'button returned of result' 2>/dev/null) || TYPE_CHOICE=""
+
+    case "$TYPE_CHOICE" in
+        "Movie")     TYPE="movie" ;;
+        "TV Series") TYPE="tv" ;;
+        *)
+            blue "Cancelled. Ejecting disc."
+            drutil eject 2>/dev/null || true
+            exit 0
+            ;;
+    esac
+    green "Type: $TYPE"
+elif [[ -z "$TYPE" || "$TYPE" == "auto" ]]; then
+    # Fallback if SKIP_PROMPT=true but type wasn't specified (shouldn't happen)
+    if [[ $LONG_TITLES -gt 3 ]]; then TYPE="tv"; else TYPE="movie"; fi
+    blue "Auto-detected: $TYPE"
+fi
+
+# ── TMDB lookup for proper naming ───────────────────────────────────────────
+TMDB_KEY="8265bd1679663a7ea12ac168da84d2e8"
+TMDB_NAME=""
+TMDB_YEAR=""
+TMDB_ID=""
+TMDB_URL=""
+
+blue "Searching TMDB for: $SEARCH_NAME"
+
+if [[ "$TYPE" == "movie" ]]; then
+    TMDB_RESULT=$(curl -s --max-time 10 "https://api.themoviedb.org/3/search/movie?api_key=$TMDB_KEY&query=$(echo "$SEARCH_NAME" | sed 's/ /+/g')" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    results = d.get('results', [])
+    if results:
+        # Show top 3 for interactive selection
+        for i, r in enumerate(results[:3]):
+            name = r.get('title','')
+            year = r.get('release_date','')[:4]
+            rid = r.get('id','')
+            print(f'{name}|{year}|{rid}')
+except: pass
+" 2>/dev/null)
+    TMDB_TYPE="movie"
+else
+    TMDB_RESULT=$(curl -s --max-time 10 "https://api.themoviedb.org/3/search/tv?api_key=$TMDB_KEY&query=$(echo "$SEARCH_NAME" | sed 's/ /+/g')" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    results = d.get('results', [])
+    if results:
+        ranked = sorted(results[:10], key=lambda r: r.get('popularity', 0), reverse=True)
+        for r in ranked[:3]:
+            name = r.get('name','')
+            year = r.get('first_air_date','')[:4]
+            rid = r.get('id','')
+            print(f'{name}|{year}|{rid}')
+except: pass
+" 2>/dev/null)
+    TMDB_TYPE="tv"
+fi
+
+# Parse first result as default
+TMDB_FIRST=$(echo "$TMDB_RESULT" | head -1)
+if [[ -n "$TMDB_FIRST" && "$TMDB_FIRST" != "||" ]]; then
+    TMDB_NAME=$(echo "$TMDB_FIRST" | cut -d'|' -f1)
+    TMDB_YEAR=$(echo "$TMDB_FIRST" | cut -d'|' -f2)
+    TMDB_ID=$(echo "$TMDB_FIRST" | cut -d'|' -f3)
+    TMDB_URL="https://www.themoviedb.org/$TMDB_TYPE/$TMDB_ID"
+fi
+
+# Build suggested name
+if [[ -n "$NAME_ARG" ]]; then
+    TITLE_NAME="$NAME_ARG"
+elif [[ -n "$TMDB_NAME" ]]; then
+    if [[ -n "$TMDB_YEAR" && "$TYPE" == "movie" ]]; then
+        TITLE_NAME="$TMDB_NAME ($TMDB_YEAR)"
+    else
+        TITLE_NAME="$TMDB_NAME"
+    fi
+else
+    TITLE_NAME="$CLEAN_NAME"
+fi
+# Sanitize title for NTFS filesystem (no apostrophes, colons, slashes, newlines)
+TITLE_NAME=$(echo "$TITLE_NAME" | tr -d "'\r\n" | sed "s/:/ -/g" | tr '/' '-')
+
+# ── Confirm name (GUI dialog unless fully scripted) ──────────────────────
+if [[ "$SKIP_PROMPT" == "false" ]]; then
+    # Open TMDB in browser — best match if found, otherwise search page
+    if [[ -n "$TMDB_URL" ]]; then
+        open "$TMDB_URL" 2>/dev/null || true
+    else
+        SEARCH_URL="https://www.themoviedb.org/search?query=$(echo "$SEARCH_NAME" | sed 's/ /+/g')"
+        open "$SEARCH_URL" 2>/dev/null || true
+    fi
+
+    # Log TMDB results for reference
+    echo ""
+    if [[ -n "$TMDB_RESULT" ]]; then
+        blue "TMDB results:"
+        IDX=1
+        while IFS='|' read -r t_name t_year t_rid; do
+            [[ -z "$t_name" ]] && continue
+            echo "  $IDX) $t_name ($t_year)  [tmdb:$t_rid]"
+            IDX=$((IDX + 1))
+        done <<< "$TMDB_RESULT"
+    fi
+    echo ""
+
+    # Build AppleScript dialog showing TMDB matches + editable title field
+    NAME_AS="/tmp/mediahub_name_dialog.scpt"
+    {
+        echo 'set msg to "TMDB matches (best guess opened in browser):" & return & return'
+        if [[ -n "$TMDB_RESULT" ]]; then
+            IDX=1
+            while IFS='|' read -r t_name t_year t_rid; do
+                [[ -z "$t_name" ]] && continue
+                SAFE_LINE=$(echo "${IDX}) ${t_name} (${t_year}) [tmdb:${t_rid}]" | sed 's/"/\\"/g')
+                echo "set msg to msg & \"${SAFE_LINE}\" & return"
+                IDX=$((IDX + 1))
+            done <<< "$TMDB_RESULT"
+        else
+            echo 'set msg to msg & "No TMDB results found." & return'
+        fi
+        SAFE_TITLE_AS=$(echo "$TITLE_NAME" | sed 's/"/\\"/g')
+        echo 'set msg to msg & return & "Confirm title (or enter tmdb:ID to override):"'
+        echo "display dialog msg default answer \"${SAFE_TITLE_AS}\" buttons {\"Cancel\", \"OK\"} default button \"OK\" with title \"Media Hub — Title\""
+        echo 'text returned of result'
+    } > "$NAME_AS"
+
+    if NAME_INPUT=$(osascript "$NAME_AS" 2>/dev/null); then
+        NAME_INPUT=$(echo "$NAME_INPUT" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        if [[ -z "$NAME_INPUT" ]]; then
+            : # Empty field with OK = keep default
+        elif [[ "$NAME_INPUT" =~ ^https?:// ]]; then
+            # User pasted a URL instead of a title — warn and keep TMDB default
+            red "URL detected in name field — ignoring. Using: $TITLE_NAME"
+            osascript -e "display notification \"URL ignored — using TMDB name: $TITLE_NAME\" with title \"Media Hub\" sound name \"Basso\"" 2>/dev/null || true
+        elif [[ "$NAME_INPUT" =~ ^tmdb:([0-9]+)$ ]] || [[ "$NAME_INPUT" =~ ^([0-9]+)$ ]]; then
+            OVERRIDE_ID="${BASH_REMATCH[1]}"
+            blue "Looking up TMDB ID $OVERRIDE_ID..."
+            if [[ "$TYPE" == "movie" ]]; then
+                LOOKUP=$(curl -s --max-time 10 "https://api.themoviedb.org/3/movie/$OVERRIDE_ID?api_key=$TMDB_KEY" 2>/dev/null)
+            else
+                LOOKUP=$(curl -s --max-time 10 "https://api.themoviedb.org/3/tv/$OVERRIDE_ID?api_key=$TMDB_KEY" 2>/dev/null)
+            fi
+            LOOKUP_NAME=$(echo "$LOOKUP" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('name', d.get('title', '')))
+" 2>/dev/null)
+            LOOKUP_YEAR=$(echo "$LOOKUP" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+date = d.get('first_air_date', d.get('release_date', ''))
+print(date[:4] if date else '')
+" 2>/dev/null)
+            if [[ -n "$LOOKUP_NAME" ]]; then
+                TMDB_NAME="$LOOKUP_NAME"
+                TMDB_YEAR="$LOOKUP_YEAR"
+                TMDB_ID="$OVERRIDE_ID"
+                if [[ "$TYPE" == "movie" && -n "$TMDB_YEAR" ]]; then
+                    TITLE_NAME="$TMDB_NAME ($TMDB_YEAR)"
+                else
+                    TITLE_NAME="$TMDB_NAME"
+                fi
+                TITLE_NAME=$(echo "$TITLE_NAME" | tr -d "'\r\n" | sed "s/:/ -/g" | tr '/' '-')
+                green "Resolved: $TITLE_NAME (tmdb:$TMDB_ID)"
+            else
+                red "TMDB ID $OVERRIDE_ID not found, using entered text"
+                TITLE_NAME=$(echo "$NAME_INPUT" | tr -d "'\r\n" | sed "s/:/ -/g" | tr '/' '-')
+            fi
+        else
+            TITLE_NAME=$(echo "$NAME_INPUT" | tr -d "'\r\n" | sed "s/:/ -/g" | tr '/' '-')
+        fi
+    else
+        # User clicked Cancel
+        rm -f "$NAME_AS"
+        blue "Cancelled. Ejecting disc."
+        drutil eject 2>/dev/null || true
+        exit 0
+    fi
+    rm -f "$NAME_AS"
+    green "Name: $TITLE_NAME"
+else
+    if [[ -n "$TMDB_NAME" ]]; then
+        green "TMDB match: $TMDB_NAME ($TMDB_YEAR)"
+        [[ -n "$TMDB_URL" ]] && blue "  $TMDB_URL"
+    fi
+fi
+
+# ── Season (TV only) ─────────────────────────────────────────────────────
+SEASON="1"
+if [[ "$TYPE" == "tv" ]]; then
+    # Default: arg > detected > 1
+    if [[ -n "$SEASON_ARG" ]]; then
+        SEASON="$SEASON_ARG"
+    elif [[ -n "$DETECTED_SEASON" ]]; then
+        SEASON="$DETECTED_SEASON"
+    fi
+
+    if [[ "$SKIP_PROMPT" == "false" ]]; then
+        DISC_HINT=""
+        [[ -n "$DETECTED_DISC" ]] && DISC_HINT=" (disc $DETECTED_DISC)"
+        if SEASON_INPUT=$(osascript \
+            -e "display dialog \"Season number for: $TITLE_NAME${DISC_HINT}\" default answer \"$SEASON\" buttons {\"Cancel\", \"OK\"} default button \"OK\" with title \"Media Hub — Season\"" \
+            -e 'text returned of result' 2>/dev/null); then
+            SEASON_INPUT=$(echo "$SEASON_INPUT" | grep -oE '[0-9]+' | head -1)
+            [[ -n "$SEASON_INPUT" ]] && SEASON="$SEASON_INPUT"
+        else
+            blue "Cancelled. Ejecting disc."
+            drutil eject 2>/dev/null || true
+            exit 0
+        fi
+        green "Season: $SEASON"
+    else
+        [[ -n "$DETECTED_DISC" ]] && blue "Detected disc number: $DETECTED_DISC"
+        [[ -n "$DETECTED_SEASON" ]] && blue "Detected season: $DETECTED_SEASON"
+    fi
+fi
+
+# ── Quality picker ─────────────────────────────────────────────────────────
+# CRF 14 is the new default (~3-4 GB movies, near-disc quality). For sources
+# where CRF 20 looks fine and you want smaller files (~1 GB), pick Standard.
+if [[ "$SKIP_PROMPT" == "false" ]]; then
+    Q_BTN=$(osascript \
+        -e "display dialog \"Quality preset for $TITLE_NAME?\" & return & return & \"High (CRF 14, ~3-4 GB) — closer to disc quality\" & return & \"Standard (CRF 20, ~1 GB) — smaller files\" buttons {\"Cancel\", \"Standard\", \"High\"} default button \"High\" with title \"Media Hub — Quality\"" \
+        -e 'button returned of result' 2>/dev/null) || Q_BTN=""
+    case "$Q_BTN" in
+        "High")     QUALITY=14 ;;
+        "Standard") QUALITY=20 ;;
+        *)          blue "Cancelled. Ejecting disc."; drutil eject 2>/dev/null || true; exit 0 ;;
+    esac
+    green "Quality: CRF $QUALITY"
+fi
+
+# ── Pre-rip analysis for TV (play-all detection via TINFO) ────────────────
+# For TV discs, use dvd-analyze.py to identify play-all and episode titles
+# BEFORE ripping, so we skip the 3+ hour play-all entirely.
+RAW_DIR="/tmp/mediahub_rip/${DISC_NAME}_$(date +%Y%m%d)"
+mkdir -p "$RAW_DIR"
+
+if [[ "$TYPE" == "movie" ]]; then
+    MIN_LEN=$MIN_MOVIE_SECONDS
+else
+    MIN_LEN=$MIN_TV_SECONDS
+fi
+
+if [[ "$TYPE" == "tv" ]]; then
+    # Save DISC_INFO for dvd-analyze.py
+    DISC_INFO_FILE="/tmp/mediahub_disc_info.txt"
+    echo "$DISC_INFO" > "$DISC_INFO_FILE"
+
+    # Run multi-signal play-all detection (chapter count + segment maps + duration)
+    ANALYZE_JSON=$(python3 "$HOME/bin/dvd-analyze.py" --json "$DISC_INFO_FILE" 2>/dev/null || echo "")
+
+    if [[ -n "$ANALYZE_JSON" ]] && echo "$ANALYZE_JSON" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+        PLAY_ALL_ID=$(echo "$ANALYZE_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+pa = d.get('play_all')
+print(pa['title_id'] if pa and pa.get('title_id') is not None else '')
+" 2>/dev/null)
+        EPISODE_IDS=$(echo "$ANALYZE_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(' '.join(str(e['title_id']) for e in d.get('episodes', [])))
+" 2>/dev/null)
+        EP_COUNT=$(echo "$EPISODE_IDS" | wc -w | xargs)
+
+        if [[ -n "$PLAY_ALL_ID" ]]; then
+            PA_REASON=$(echo "$ANALYZE_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+pa = d.get('play_all', {})
+print(pa.get('reason', 'unknown'))
+" 2>/dev/null)
+            blue "Play-all detected: title $PLAY_ALL_ID ($PA_REASON)"
+        fi
+
+        if [[ $EP_COUNT -gt 0 ]]; then
+            # Show episode analysis
+            echo ""
+            echo "$ANALYZE_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+pa = d.get('play_all')
+if pa:
+    print(f'  SKIP  title {pa[\"title_id\"]:2d}  (play-all, score={pa[\"score\"]})')
+for i, ep in enumerate(d.get('episodes', []), 1):
+    print(f'  E{i:02d}   title {ep[\"title_id\"]:2d}  {ep[\"duration\"]}  ({ep[\"chapters\"]} chapters)')
+" 2>/dev/null
+            echo ""
+
+            # GUI dialog: confirm episodes or override title IDs
+            if [[ "$SKIP_PROMPT" == "false" ]]; then
+                EP_AS="/tmp/mediahub_ep_dialog.scpt"
+                {
+                    echo 'set msg to ""'
+                    echo "$ANALYZE_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+pa = d.get('play_all')
+if pa:
+    print('set msg to msg & \"SKIP  title %d  (play-all, score=%d)\" & return' % (pa['title_id'], pa['score']))
+for i, ep in enumerate(d.get('episodes', []), 1):
+    print('set msg to msg & \"E%02d   title %d  %s  (%d ch)\" & return' % (i, ep['title_id'], ep['duration'], ep['chapters']))
+" 2>/dev/null
+                    echo "set msg to msg & return & \"Rip these $EP_COUNT episodes?\""
+                    echo "display dialog msg buttons {\"Cancel\", \"Override\", \"Rip\"} default button \"Rip\" with title \"Media Hub — Episodes\""
+                    echo 'button returned of result'
+                } > "$EP_AS"
+
+                EP_BTN=$(osascript "$EP_AS" 2>/dev/null) || EP_BTN=""
+                rm -f "$EP_AS"
+
+                case "$EP_BTN" in
+                    "Rip")
+                        green "Confirmed: ripping $EP_COUNT episodes"
+                        ;;
+                    "Override")
+                        OVERRIDE_IDS=$(osascript \
+                            -e "display dialog \"Enter title IDs (space-separated):\" default answer \"$EPISODE_IDS\" buttons {\"Cancel\", \"OK\"} default button \"OK\" with title \"Media Hub\"" \
+                            -e 'text returned of result' 2>/dev/null) || OVERRIDE_IDS=""
+                        if [[ -n "$OVERRIDE_IDS" ]]; then
+                            EPISODE_IDS="$OVERRIDE_IDS"
+                            EP_COUNT=$(echo "$EPISODE_IDS" | wc -w | xargs)
+                            green "Override: ripping titles $EPISODE_IDS ($EP_COUNT episodes)"
+                        fi
+                        ;;
+                    *)
+                        blue "Cancelled. Ejecting disc."
+                        drutil eject 2>/dev/null || true
+                        exit 0
+                        ;;
+                esac
+            else
+                green "Pre-rip analysis: $EP_COUNT episodes (titles: $EPISODE_IDS)"
+            fi
+
+            # ── Per-episode pipeline: rip → transcode → copy, one at a time ──
+            SEASON_PAD=$(printf "%02d" "$SEASON")
+
+            # Lock show name across discs
+            if [[ -d "$MEDIA_ROOT/tvshows" ]]; then
+                if [[ ! -d "$MEDIA_ROOT/tvshows/$TITLE_NAME" ]]; then
+                    SEARCH_WORD=$(echo "$TITLE_NAME" | awk '{print $NF}')
+                    while IFS= read -r dir; do
+                        dir_base=$(basename "$dir")
+                        if [[ -d "$dir/Season $SEASON_PAD" ]]; then
+                            blue "Reusing existing show folder: $dir_base (was: $TITLE_NAME)"
+                            TITLE_NAME="$dir_base"
+                            break
+                        fi
+                    done < <(find "$MEDIA_ROOT/tvshows" -maxdepth 1 -type d -iname "*${SEARCH_WORD}*" 2>/dev/null)
+                fi
+            fi
+
+            DEST_DIR="$MEDIA_ROOT/tvshows/$TITLE_NAME/Season $SEASON_PAD"
+            mkdir -p "$DEST_DIR" 2>/dev/null
+
+            # Episode counter
+            STATE_DIR="$HOME/.mediahub/state"
+            mkdir -p "$STATE_DIR"
+            SAFE_TITLE=$(echo "$TITLE_NAME" | tr ' /' '__' | tr -d "'")
+            EP_FILE="$STATE_DIR/${SAFE_TITLE}_S${SEASON_PAD}.ep"
+            if [[ -f "$EP_FILE" ]]; then
+                EP=$(cat "$EP_FILE" | tr -d '[:space:]')
+                if [[ "$EP" =~ ^[0-9]+$ && "$EP" -gt 0 ]]; then
+                    blue "Continuing from episode $EP (previous disc)"
+                else
+                    red "Corrupt counter file ($EP_FILE = '$EP') — resetting to 1"
+                    EP=1
+                fi
+            else
+                EP=1
+            fi
+            FIRST_EP=$EP
+            STAGE_DIR="/tmp/mediahub_transcode"
+            mkdir -p "$STAGE_DIR"
+
+            for tid in $EPISODE_IDS; do
+                EP_PAD=$(printf "E%02d" "$EP")
+                blue "[$EP_PAD] Ripping title $tid..."
+                "$MAKEMKVCON" mkv disc:0 "$tid" "$RAW_DIR" --minlength="$MIN_LEN" 2>&1 | \
+                    grep --line-buffered -E "Saving|Title|[Ee]rror|completed|Copy|%" || true
+
+                # Find the MKV just ripped (newest file in RAW_DIR)
+                LATEST_MKV=$(ls -t "$RAW_DIR"/*.mkv 2>/dev/null | head -1)
+                if [[ -z "$LATEST_MKV" ]]; then
+                    red "[$EP_PAD] No MKV produced for title $tid — skipping"
+                    EP=$((EP + 1))
+                    continue
+                fi
+
+                STAGED="$STAGE_DIR/${TITLE_NAME} - S${SEASON_PAD}${EP_PAD}.mp4"
+                blue "[$EP_PAD] Transcoding..."
+                "$HANDBRAKE" -i "$LATEST_MKV" -o "$STAGED" \
+                    --preset="Fast 1080p30" --encoder=x264 --quality="$QUALITY" --format=mp4 \
+                    --optimize --subtitle="scan,1,2,3" --subtitle-burned="none" \
+                    --audio="1,2" --aencoder="copy,aac" --audio-fallback="aac" </dev/null 2>/dev/null || {
+                    red "[$EP_PAD] Transcode failed — skipping"
+                    EP=$((EP + 1))
+                    continue
+                }
+                # Verify transcode produced a real file
+                if [[ ! -f "$STAGED" ]] || [[ ! -s "$STAGED" ]]; then
+                    red "[$EP_PAD] Transcode produced empty output — skipping"
+                    EP=$((EP + 1))
+                    continue
+                fi
+
+                # Re-check M4Drive is still mounted before copy
+                if [[ ! -d "$DEST_DIR" ]]; then
+                    red "[$EP_PAD] M4Drive unmounted! Keeping temp files in $STAGE_DIR"
+                    exit 1
+                fi
+                blue "[$EP_PAD] Copying to M4Drive..."
+                cp "$STAGED" "$DEST_DIR/"
+                # Verify copy before deleting source (NTFS can silently fail)
+                SRC_SZ=$(stat -f%z "$STAGED" 2>/dev/null || echo 0)
+                DST_SZ=$(stat -f%z "$DEST_DIR/${TITLE_NAME} - S${SEASON_PAD}${EP_PAD}.mp4" 2>/dev/null || echo 0)
+                if [[ "$SRC_SZ" -gt 0 && "$SRC_SZ" == "$DST_SZ" ]]; then
+                    rm -f "$STAGED" "$LATEST_MKV"
+                else
+                    red "[$EP_PAD] Copy verification failed (src=${SRC_SZ} dst=${DST_SZ}) — keeping temp files"
+                fi
+
+                SIZE=$(du -h "$DEST_DIR/${TITLE_NAME} - S${SEASON_PAD}${EP_PAD}.mp4" 2>/dev/null | cut -f1)
+                green "[$EP_PAD] Done ($SIZE) → $DEST_DIR/"
+
+                EP=$((EP + 1))
+                echo "$EP" > "$EP_FILE"
+            done
+            green "TV ready: $((EP - FIRST_EP)) episodes (S${SEASON_PAD}E$(printf '%02d' $FIRST_EP)-E$(printf '%02d' $((EP-1))))"
+
+        else
+            red "Analyzer found no episodes on this disc."
+            osascript -e 'display dialog "No episodes detected. Check disc." buttons {"OK"} with title "Media Hub" with icon stop' 2>/dev/null || true
+            rm -f "$DISC_INFO_FILE"
+            drutil eject 2>/dev/null || true
+            exit 1
+        fi
+    else
+        red "Disc analyzer failed."
+        osascript -e 'display dialog "Disc analysis failed. Try again." buttons {"OK"} with title "Media Hub" with icon stop' 2>/dev/null || true
+        exit 1
+    fi
+    rm -f "$DISC_INFO_FILE"
+
+else
+    # ── Movie: rip all → transcode longest → copy ────────────────────────
+    blue "Ripping to $RAW_DIR (min ${MIN_LEN}s)..."
+    "$MAKEMKVCON" mkv disc:0 all "$RAW_DIR" --minlength="$MIN_LEN" 2>&1 | \
+        grep --line-buffered -E "Saving|Title|[Ee]rror|completed|Copy|%" || true
+
+    # Pick the longest title by duration, not file size — featurettes/extras
+    # can have higher bitrate than the main feature and beat it on bytes.
+    FFPROBE="${HOME}/bin/ffprobe"
+    [[ -x "$FFPROBE" ]] || FFPROBE="/Applications/Jellyfin.app/Contents/MacOS/ffprobe"
+    MAIN_MKV=""
+    BEST_DUR=0
+    for f in "$RAW_DIR"/*.mkv; do
+        [[ -f "$f" ]] || continue
+        dur=$("$FFPROBE" -v error -show_entries format=duration -of default=nw=1:nk=1 "$f" 2>/dev/null | cut -d. -f1)
+        [[ -z "$dur" ]] && dur=0
+        if (( dur > BEST_DUR )); then
+            BEST_DUR=$dur
+            MAIN_MKV="$f"
+        fi
+    done
+    [[ -n "$MAIN_MKV" ]] && blue "Main feature: $(basename "$MAIN_MKV") (${BEST_DUR}s = $((BEST_DUR/60)) min)"
+    if [[ -z "$MAIN_MKV" ]]; then
+        red "No titles ripped. Disc may be scratched."
+        rm -rf "$RAW_DIR" 2>/dev/null
+        drutil eject 2>/dev/null || true
+        exit 1
+    fi
+
+    STAGE_DIR="/tmp/mediahub_transcode"
+    mkdir -p "$STAGE_DIR"
+    STAGED="$STAGE_DIR/${TITLE_NAME}.mp4"
+
+    blue "Transcoding: $(basename "$MAIN_MKV") → ${TITLE_NAME}.mp4"
+    "$HANDBRAKE" -i "$MAIN_MKV" -o "$STAGED" \
+        --preset="Fast 1080p30" --encoder=x264 --quality="$QUALITY" --format=mp4 \
+        --optimize --subtitle="scan,1,2,3" --subtitle-burned="none" \
+        --audio="1,2" --aencoder="copy,aac" --audio-fallback="aac" </dev/null 2>/dev/null
+
+    # Verify transcode produced a real file
+    if [[ ! -f "$STAGED" ]] || [[ ! -s "$STAGED" ]]; then
+        red "Transcode produced no output. Disc may be corrupted."
+        rm -rf "$RAW_DIR" 2>/dev/null
+        drutil eject 2>/dev/null || true
+        exit 1
+    fi
+
+    DEST_DIR="$MEDIA_ROOT/movies/$TITLE_NAME"
+    # Re-check M4Drive before copy
+    if [[ ! -d "$MEDIA_ROOT/movies" ]]; then
+        red "M4Drive unmounted! Keeping temp files."
+        exit 1
+    fi
+    mkdir -p "$DEST_DIR" 2>/dev/null
+    cp "$STAGED" "$DEST_DIR/${TITLE_NAME}.mp4"
+    # Verify copy before deleting source (NTFS can silently fail)
+    SRC_SZ=$(stat -f%z "$STAGED" 2>/dev/null || echo 0)
+    DST_SZ=$(stat -f%z "$DEST_DIR/${TITLE_NAME}.mp4" 2>/dev/null || echo 0)
+    if [[ "$SRC_SZ" -gt 0 && "$SRC_SZ" == "$DST_SZ" ]]; then
+        rm -f "$STAGED"
+    else
+        red "Copy verification failed (src=${SRC_SZ} dst=${DST_SZ}) — keeping $STAGED"
+    fi
+
+    SIZE=$(du -h "$DEST_DIR/${TITLE_NAME}.mp4" | cut -f1)
+    green "Movie ready: $DEST_DIR/${TITLE_NAME}.mp4 ($SIZE)"
+fi
+
+# ── Cleanup + Eject + Notify ────────────────────────────────────────────────
+rm -rf "$RAW_DIR" 2>/dev/null
+rm -rf "$STAGE_DIR" 2>/dev/null
+rm -f /tmp/autorip.lock 2>/dev/null
+
+drutil eject 2>/dev/null || diskutil eject /dev/disk7 2>/dev/null || true
+green "Disc ejected."
+
+# Trigger Jellyfin library scan
+JELLYFIN_TOKEN=$(cat "$HOME/.jellyfin_token" 2>/dev/null || echo "")
+if [[ -n "$JELLYFIN_TOKEN" ]]; then
+    curl -s -X POST "http://localhost:8096/Library/Refresh" \
+        -H "X-Emby-Authorization: MediaBrowser Client=\"rip\", Device=\"Mac\", DeviceId=\"rip1\", Version=\"1.0\", Token=\"$JELLYFIN_TOKEN\"" \
+        2>/dev/null && blue "Jellyfin library scan triggered."
+fi
+
+osascript -e "display notification \"$TITLE_NAME rip complete\" with title \"Media Hub\" sound name \"Glass\"" 2>/dev/null || true
+
+green "Done! $TITLE_NAME is ready in Jellyfin."
