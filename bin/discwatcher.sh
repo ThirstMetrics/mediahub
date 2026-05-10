@@ -58,8 +58,15 @@ while true; do
                 log "Rip completed successfully"
                 rm -f "$FAIL_FILE"
             else
-                log "Rip failed (exit $?) — waiting for disc removal before retry"
+                EXIT_CODE=$?
+                log "Rip failed (exit $EXIT_CODE) — waiting for disc removal before retry"
                 touch "$FAIL_FILE"
+                # Notify the user immediately. Otherwise a failed rip is
+                # silent and they only discover it next time they check.
+                osascript -e "display notification \"Rip FAILED (exit ${EXIT_CODE}) — see discwatcher.log. Eject disc to retry.\" with title \"Media Hub\" sound name \"Basso\"" 2>/dev/null || true
+                # Also try to eject so the disc isn't stuck — the rip script's
+                # eject paths may not have run if it died early.
+                drutil eject 2>/dev/null || diskutil eject "$(diskutil list 2>/dev/null | awk '/External, Physical/{print "/dev/"$NF}' | head -1)" 2>/dev/null || true
             fi
 
             rm -f "$LOCK_FILE"

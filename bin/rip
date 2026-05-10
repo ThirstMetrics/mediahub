@@ -98,13 +98,18 @@ TYPE="${1:-}"
 NAME_ARG="${2:-}"
 SEASON_ARG="${3:-}"
 
-# SKIP_PROMPT: only when all args are explicitly provided
-# e.g. "rip tv 'Show Name' 2" — that's a fully scripted call, no dialogs.
-# Anything else (rip, rip auto, rip movie, rip tv) gets dialogs.
+# SKIP_PROMPT: skip all GUI dialogs and use auto-detected defaults.
+# Triggered by:
+#   - Fully scripted args (rip movie "Name" / rip tv "Show" 2)
+#   - Non-interactive launch (no TTY on stdin) — e.g. discwatcher.sh from launchd.
+#     Without this, the AppleScript dialog times out after 2 minutes and the
+#     whole script dies with exit 69 because of `set -euo pipefail` above.
 SKIP_PROMPT=false
 if [[ "$TYPE" == "movie" && -n "$NAME_ARG" ]]; then
     SKIP_PROMPT=true
 elif [[ "$TYPE" == "tv" && -n "$NAME_ARG" && -n "$SEASON_ARG" ]]; then
+    SKIP_PROMPT=true
+elif [[ ! -t 0 ]]; then
     SKIP_PROMPT=true
 fi
 
@@ -759,7 +764,12 @@ rm -rf "$RAW_DIR" 2>/dev/null
 rm -rf "$STAGE_DIR" 2>/dev/null
 rm -f /tmp/autorip.lock 2>/dev/null
 
-drutil eject 2>/dev/null || diskutil eject /dev/disk7 2>/dev/null || true
+# Eject — try drutil first, then diskutil with auto-detected device
+# (was hardcoded /dev/disk7 which only matched one machine's setup).
+if ! drutil eject 2>/dev/null; then
+    DISC_DEV=$(diskutil list 2>/dev/null | awk '/External, Physical/{print "/dev/"$NF; exit}')
+    [[ -n "$DISC_DEV" ]] && diskutil eject "$DISC_DEV" 2>/dev/null || true
+fi
 green "Disc ejected."
 
 # Trigger Jellyfin library scan
