@@ -121,6 +121,11 @@ SEARCH_NAME=$(echo "$CLEAN_NAME" | sed -E 's/[Ss]eries *[0-9]+//gi; s/[Ss]eason 
 # Count long titles for auto-detect suggestion
 LONG_TITLES=$(echo "$DISC_INFO" | grep "^TINFO:" | grep ",9,0," | awk -F',' '{gsub(/"/, "", $NF); split($NF, t, ":"); secs=t[1]*3600+t[2]*60+t[3]; if(secs>=1200) print}' | wc -l | xargs)
 
+# MakeMKV's MainFeature heuristic (requires JRE; emits FPL_MainFeature in title comment).
+# When present, we can rip just that title and skip the post-rip duration tie-breaker.
+MAIN_FEATURE_TID=$(echo "$DISC_INFO" | grep "FPL_MainFeature" | head -1 | grep -oE '^TINFO:[0-9]+' | grep -oE '[0-9]+$' || true)
+[[ -n "$MAIN_FEATURE_TID" ]] && echo "  Main feature:  title #$MAIN_FEATURE_TID (MakeMKV/Java tagged)"
+
 # ── Title summary (always shown) ─────────────────────────────────────────
 echo ""
 echo "  Disc label:    $DISC_NAME"
@@ -673,10 +678,19 @@ for i, ep in enumerate(d.get('episodes', []), 1):
     rm -f "$DISC_INFO_FILE"
 
 else
-    # ── Movie: rip all → transcode longest → copy ────────────────────────
-    blue "Ripping to $RAW_DIR (min ${MIN_LEN}s)..."
-    "$MAKEMKVCON" mkv disc:0 all "$RAW_DIR" --minlength="$MIN_LEN" 2>&1 | \
-        grep --line-buffered -E "Saving|Title|[Ee]rror|completed|Copy|%" || true
+    # ── Movie: rip → transcode → copy ────────────────────────────────────
+    # If MakeMKV's Java heuristic flagged a main feature, rip only that title
+    # (saves 30-60 min on big discs and eliminates the post-rip tie-breaker).
+    # Otherwise fall back to ripping all titles >= MIN_LEN.
+    if [[ -n "$MAIN_FEATURE_TID" ]]; then
+        blue "Ripping title #$MAIN_FEATURE_TID (FPL_MainFeature) to $RAW_DIR..."
+        "$MAKEMKVCON" mkv disc:0 "$MAIN_FEATURE_TID" "$RAW_DIR" --minlength="$MIN_LEN" 2>&1 | \
+            grep --line-buffered -E "Saving|Title|[Ee]rror|completed|Copy|%" || true
+    else
+        blue "Ripping to $RAW_DIR (min ${MIN_LEN}s)..."
+        "$MAKEMKVCON" mkv disc:0 all "$RAW_DIR" --minlength="$MIN_LEN" 2>&1 | \
+            grep --line-buffered -E "Saving|Title|[Ee]rror|completed|Copy|%" || true
+    fi
 
     # Pick the longest title by duration, not file size — featurettes/extras
     # can have higher bitrate than the main feature and beat it on bytes.
