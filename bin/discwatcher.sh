@@ -63,7 +63,15 @@ while true; do
             fi
 
             rm -f "$LOCK_FILE"
-            log "Ready for next disc"
+
+            # Wait for disc removal before next iteration. If rip auto-ejected
+            # (success path in bin/rip), this exits immediately. If the eject
+            # silently failed (drive busy, wrong /dev/diskN, etc.), this hangs
+            # here until manual removal — preventing the same disc from being
+            # ripped twice in a row.
+            log "Waiting for disc removal..."
+            while check_disc; do sleep 5; done
+            log "Disc removed — ready for next disc"
         fi
     elif check_audio_cd; then
         if [[ -f "$FAIL_FILE" ]]; then

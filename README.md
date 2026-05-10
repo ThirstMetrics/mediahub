@@ -33,10 +33,18 @@ cp /Volumes/HandBrake*/HandBrakeCLI ~/bin/HandBrakeCLI
 chmod +x ~/bin/HandBrakeCLI
 hdiutil detach /Volumes/HandBrake* -quiet
 
-#    ffmpeg (Apple Silicon — adjust URL for Intel from https://www.osxexperts.net/):
-curl -L -o /tmp/ffmpeg.zip "https://www.osxexperts.net/ffmpeg81arm.zip"
-unzip -o /tmp/ffmpeg.zip -d /tmp && mv /tmp/ffmpeg ~/bin/ffmpeg
-chmod +x ~/bin/ffmpeg
+#    ffmpeg + ffprobe (Apple Silicon — adjust URL for Intel from https://www.osxexperts.net/):
+curl -L -o /tmp/ffmpeg.zip  "https://www.osxexperts.net/ffmpeg81arm.zip"
+curl -L -o /tmp/ffprobe.zip "https://www.osxexperts.net/ffprobe81arm.zip"
+unzip -o /tmp/ffmpeg.zip  -d /tmp && mv /tmp/ffmpeg  ~/bin/ffmpeg
+unzip -o /tmp/ffprobe.zip -d /tmp && mv /tmp/ffprobe ~/bin/ffprobe
+chmod +x ~/bin/ffmpeg ~/bin/ffprobe
+
+#    Java JRE (for MakeMKV's main-feature heuristic — without this, MakeMKV
+#    rips every title >= --minlength instead of just the feature):
+curl -L -o /tmp/jre.pkg \
+  "https://api.adoptium.net/v3/installer/latest/21/ga/mac/aarch64/jre/hotspot/normal/eclipse"
+sudo installer -pkg /tmp/jre.pkg -target /
 
 #    MakeMKV (drag-install GUI app):
 curl -L -o /tmp/makemkv.dmg "https://www.makemkv.com/download/makemkv_v1.18.3_osx.dmg"
