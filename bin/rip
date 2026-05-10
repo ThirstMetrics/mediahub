@@ -303,6 +303,27 @@ if [[ -n "$TMDB_FIRST" && "$TMDB_FIRST" != "||" ]]; then
     TMDB_URL="https://www.themoviedb.org/$TMDB_TYPE/$TMDB_ID"
 fi
 
+# Genre-driven quality default. Action holds up at CRF 20 (~1 GB) — the
+# fast cuts and motion mask compression artifacts. Comedy/drama/everything
+# else picks CRF 14 (~3-4 GB) where dialog nuance and faces matter.
+TMDB_GENRES=""
+DEFAULT_QUALITY=14
+DEFAULT_QUALITY_NAME="High"
+if [[ -n "$TMDB_ID" ]]; then
+    TMDB_GENRES=$(curl -s --max-time 5 "https://api.themoviedb.org/3/$TMDB_TYPE/$TMDB_ID?api_key=$TMDB_KEY" 2>/dev/null \
+        | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(','.join(g['name'] for g in d.get('genres', [])))
+except: pass" 2>/dev/null)
+    if [[ "$TMDB_GENRES" == *"Action"* ]]; then
+        DEFAULT_QUALITY=20
+        DEFAULT_QUALITY_NAME="Standard"
+    fi
+fi
+[[ -n "$TMDB_GENRES" ]] && blue "Genres: $TMDB_GENRES → CRF $DEFAULT_QUALITY ($DEFAULT_QUALITY_NAME)"
+
 # Build suggested name
 if [[ -n "$NAME_ARG" ]]; then
     TITLE_NAME="$NAME_ARG"
@@ -454,11 +475,13 @@ if [[ "$TYPE" == "tv" ]]; then
 fi
 
 # ── Quality picker ─────────────────────────────────────────────────────────
-# CRF 14 is the new default (~3-4 GB movies, near-disc quality). For sources
-# where CRF 20 looks fine and you want smaller files (~1 GB), pick Standard.
+# Default chosen above by genre (Action → CRF 20, else CRF 14). Dialog
+# pre-selects that default; user can override interactively.
 if [[ "$SKIP_PROMPT" == "false" ]]; then
+    GENRE_HINT=""
+    [[ -n "$TMDB_GENRES" ]] && GENRE_HINT=" & return & return & \"Suggested by genre: $DEFAULT_QUALITY_NAME ($TMDB_GENRES)\""
     Q_BTN=$(osascript \
-        -e "display dialog \"Quality preset for $TITLE_NAME?\" & return & return & \"High (CRF 14, ~3-4 GB) — closer to disc quality\" & return & \"Standard (CRF 20, ~1 GB) — smaller files\" buttons {\"Cancel\", \"Standard\", \"High\"} default button \"High\" with title \"Media Hub — Quality\"" \
+        -e "display dialog \"Quality preset for $TITLE_NAME?\" & return & return & \"High (CRF 14, ~3-4 GB) — closer to disc quality\" & return & \"Standard (CRF 20, ~1 GB) — smaller files\"${GENRE_HINT} buttons {\"Cancel\", \"Standard\", \"High\"} default button \"$DEFAULT_QUALITY_NAME\" with title \"Media Hub — Quality\"" \
         -e 'button returned of result' 2>/dev/null) || Q_BTN=""
     case "$Q_BTN" in
         "High")     QUALITY=14 ;;
@@ -466,6 +489,9 @@ if [[ "$SKIP_PROMPT" == "false" ]]; then
         *)          blue "Cancelled. Ejecting disc."; drutil eject 2>/dev/null || true; exit 0 ;;
     esac
     green "Quality: CRF $QUALITY"
+else
+    QUALITY=$DEFAULT_QUALITY
+    green "Quality: CRF $QUALITY (auto from genre: ${TMDB_GENRES:-unknown})"
 fi
 
 # ── Pre-rip analysis for TV (play-all detection via TINFO) ────────────────
