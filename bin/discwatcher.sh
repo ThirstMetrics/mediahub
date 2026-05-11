@@ -18,6 +18,18 @@ check_disc() {
     drutil status 2>/dev/null | grep -qi "Type:.*DVD\|Type:.*BD"
 }
 
+# Disc signature — used to detect "same disc still in" vs "new disc swapped in".
+# Combines the optical drive's mounted volume label + disc byte size, which
+# differs between every distinct disc. Empty when no disc is present.
+disc_signature() {
+    local dev label size
+    dev=$(drutil status 2>/dev/null | awk -F'Name: ' '/Name: \/dev\//{print $2; exit}')
+    [[ -z "$dev" ]] && return
+    label=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Volume Name:/{print $2; exit}')
+    size=$(drutil status 2>/dev/null | awk '/Space Used:/{print $4; exit}')
+    echo "${label}|${size}"
+}
+
 check_audio_cd() {
     # Audio CDs mount as a volume with .aiff files
     for v in /Volumes/*/; do
@@ -52,6 +64,8 @@ while true; do
             log "DVD/BD detected — starting rip..."
             osascript -e 'display notification "Disc detected — rip starting..." with title "Media Hub" sound name "Submarine"' 2>/dev/null || true
             touch "$LOCK_FILE"
+            RIPPED_DISC_SIG=$(disc_signature)
+            log "Disc signature: $RIPPED_DISC_SIG"
 
             export PATH="$HOME/bin:$PATH"
             if "$RIP" >>"$LOG_FILE" 2>&1; then
@@ -71,14 +85,23 @@ while true; do
 
             rm -f "$LOCK_FILE"
 
-            # Wait for disc removal before next iteration. If rip auto-ejected
-            # (success path in bin/rip), this exits immediately. If the eject
-            # silently failed (drive busy, wrong /dev/diskN, etc.), this hangs
-            # here until manual removal — preventing the same disc from being
-            # ripped twice in a row.
-            log "Waiting for disc removal..."
-            while check_disc; do sleep 5; done
-            log "Disc removed — ready for next disc"
+            # Wait for disc removal OR disc swap before next iteration. The
+            # earlier "while check_disc; do sleep 5" version could not tell
+            # apart "same disc stuck in drive" from "new disc inserted" —
+            # the rip would just hang forever if eject silently failed and
+            # the user swapped in something new (2026-05-10 Kingsman bug).
+            # Compare signature: if disc removed OR signature changed, proceed.
+            RIPPED_SIG="$RIPPED_DISC_SIG"
+            log "Waiting for disc removal or swap (last sig: ${RIPPED_SIG:-empty})..."
+            while check_disc; do
+                CUR_SIG=$(disc_signature)
+                if [[ "$CUR_SIG" != "$RIPPED_SIG" ]]; then
+                    log "Different disc detected (sig: $CUR_SIG) — proceeding"
+                    break
+                fi
+                sleep 5
+            done
+            check_disc || log "Disc removed — ready for next disc"
         fi
     elif check_audio_cd; then
         if [[ -f "$FAIL_FILE" ]]; then
