@@ -19,15 +19,13 @@ check_disc() {
 }
 
 # Disc signature — used to detect "same disc still in" vs "new disc swapped in".
-# Combines the optical drive's mounted volume label + disc byte size, which
-# differs between every distinct disc. Empty when no disc is present.
+# Uses the drutil-reported block count of Space Used — available the moment
+# the disc is detected (unlike Volume Name, which lags while macOS mounts).
+# Different discs almost always have different block counts; the rare case
+# of two discs with identical block counts is benign (they look the same).
+# Empty when no disc is present.
 disc_signature() {
-    local dev label size
-    dev=$(drutil status 2>/dev/null | awk -F'Name: ' '/Name: \/dev\//{print $2; exit}')
-    [[ -z "$dev" ]] && return
-    label=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Volume Name:/{print $2; exit}')
-    size=$(drutil status 2>/dev/null | awk '/Space Used:/{print $4; exit}')
-    echo "${label}|${size}"
+    drutil status 2>/dev/null | awk '/Space Used:/{print $5; exit}'
 }
 
 check_audio_cd() {

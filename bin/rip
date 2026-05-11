@@ -317,7 +317,9 @@ try:
     d = json.load(sys.stdin)
     print(','.join(g['name'] for g in d.get('genres', [])))
 except: pass" 2>/dev/null)
-    if [[ "$TMDB_GENRES" == *"Action"* ]]; then
+    # TEMPORARY OVERRIDE — user requested CRF 14 for this disc regardless of genre
+    # Restore the next line + delete this block after the disc completes.
+    if false && [[ "$TMDB_GENRES" == *"Action"* ]]; then
         DEFAULT_QUALITY=20
         DEFAULT_QUALITY_NAME="Standard"
     fi
